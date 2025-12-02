@@ -1,5 +1,6 @@
 name: Node.js AI Validation Pipeline (MCP Server)
 
+# Controls when the workflow will run (on push and pull request to 'main')
 on:
   push:
     branches: [ "main" ]
@@ -11,11 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20.x] # Use a single version for the full validation job
+        node-version: [20.x] # Use a single, stable version for the full validation job
 
     steps:
       # 1. SETUP AND BASE CHECKS
-      - uses: actions/checkout@v4 
+      - uses: actions/checkout@v4 # Get the code
         
       - name: Setup Node.js Environment
         uses: actions/setup-node@v4
@@ -26,8 +27,8 @@ jobs:
       - name: Install Project Dependencies and Agent Tools
         run: |
           npm ci
-          # Install necessary tools globally or for the script's use
-          npm install -g snyk semgrep ts-node typescript artillery # Artillery for performance
+          # Install necessary tools globally or for the script's use (ts-node, security, performance)
+          npm install -g snyk semgrep ts-node typescript artillery
 
       - name: Run Unit Tests (Base Gate)
         run: npm test
@@ -38,15 +39,20 @@ jobs:
       # 2. DATA GATHERING FOR AI AGENTS
       - name: Gather All Reports and Context
         run: |
+          echo "--- Starting Raw Data Collection for AI Agents ---"
+          
           # Security Reports (Snyk, Semgrep)
-          snyk test --json > snyk_report.json
-          semgrep --config auto --json > semgrep_report.json
+          # Use '|| true' to prevent the step from failing if vulnerabilities are found, 
+          # ensuring the AI agent receives the report.
+          snyk test --json > snyk_report.json || true
+          semgrep --config auto --json > semgrep_report.json || true
           
           # Performance Report (Simple Load Test using Artillery)
-          # Replace 'http://localhost:3000' with a test endpoint or temporary deployment URL
-          npx artillery quick --count 10 --num 5 --output performance_report.json 'http://localhost:3000/api/users'
+          # NOTE: Requires the application to be running or a dedicated test environment.
+          # We use 'npx' here to ensure Artillery runs correctly.
+          npx artillery quick --count 10 --num 5 --output performance_report.json 'http://localhost:3000/api/users' || true
           
-          # Code Context (Git Diff)
+          # Code Context (Git Diff of the latest changes)
           git diff HEAD^ HEAD --no-color > code_changes.diff
 
       # 3. EXECUTE AI AGENTS (The MCP Server Logic)
@@ -54,33 +60,61 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
         run: |
-          # Assuming llm-security-agent.ts is in the project root
+          # Execute the agent script and save the structured verdict
           ts-node llm-security-agent.ts > llm_security_report.json
 
       - name: AI Performance Agent ⚡
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
         run: |
-          # Assuming llm-performance-agent.ts is in the project root
+          # Execute the agent script and save the structured verdict
           ts-node llm-performance-agent.ts > llm_performance_report.json
 
       - name: AI Code Quality Agent ✔️
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
         run: |
-          # Assuming llm-quality-agent.ts is in the project root
+          # Execute the agent script and save the structured verdict
           ts-node llm-quality-agent.ts > llm_quality_report.json
 
       # 4. ORCHESTRATION AND QUALITY GATE
       - name: MCP Server Orchestration and Final Gate
         run: |
-          # This script aggregates the three JSON reports and enforces the FAIL verdict.
+          # This script aggregates the three JSON reports and exits with 1 if the overall verdict is 'FAIL'.
           ts-node mcp_orchestrator.ts
           
-      # 5. POST FEEDBACK (Optional but highly recommended)
-      # - uses: actions/github-script@v6
-      #   with:
-      #     script: |
-      #       const fs = require('fs');
-      #       const report = JSON.parse(fs.readFileSync('mcp_final_report.json', 'utf8'));
-      #       # Use the GitHub API to post the report.summary as a comment on the PR.
+      # 5. POST FEEDBACK (Recommended for PR workflows)
+      - name: Post AI Validation Summary to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            // Check if the final report exists and read it
+            if (!fs.existsSync('mcp_final_report.json')) {
+                console.log('Orchestrator did not produce final report. Skipping comment.');
+                return;
+            }
+            const report = JSON.parse(fs.readFileSync('mcp_final_report.json', 'utf8'));
+
+            // Create a styled comment body
+            let icon = report.overall_verdict === 'FAIL' ? '❌' : 
+                       report.overall_verdict === 'WARNING' ? '⚠️' : '✅';
+                       
+            let body = `## ${icon} AI Validation (MCP) Verdict: ${report.overall_verdict}\n\n`;
+            body += `**Summary:** ${report.summary}\n\n`;
+            body += '### Detailed Agent Results\n';
+            
+            // Add links or summarized details from the full report JSON
+            body += '- **Security Agent:** ${report.results.security.summary}\n';
+            body += '- **Performance Agent:** ${report.results.performance.summary}\n';
+            body += '- **Quality Agent:** ${report.results.quality.summary}\n';
+            body += '\n*The full report JSON is available in the workflow artifact.*';
+
+            // Post the comment to the Pull Request
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            })
