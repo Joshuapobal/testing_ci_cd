@@ -1,51 +1,86 @@
-# This is a basic workflow to help you get started with Actions
+name: Node.js AI Validation Pipeline (MCP Server)
 
-name: Node.js AI Validation Pipeline # Updated name for clarity
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  
-  # This workflow contains a single job called "build"
-  build_and_validate: # Renamed job for clarity
-    # The type of runner that the job will run on
+  build_and_validate:
     runs-on: ubuntu-latest
-
-    # Setup matrix to test on multiple Node.js versions (Best Practice)
     strategy:
       matrix:
-        node-version: [18.x, 20.x] 
+        node-version: [20.x] # Use a single version for the full validation job
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4 # 1. Checkout
+      # 1. SETUP AND BASE CHECKS
+      - uses: actions/checkout@v4 
         
-      # Setup Node.js environment
-      - name: Use Node.js ${{ matrix.node-version }} # 2. Setup Node
+      - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'npm' # Use caching for faster installs
+          cache: 'npm'
 
-      # Install project dependencies
-      - name: Install Dependencies # 3. Install Dependencies
-        run: npm ci
+      - name: Install Project Dependencies and Agent Tools
+        run: |
+          npm ci
+          # Install necessary tools globally or for the script's use
+          npm install -g snyk semgrep ts-node typescript artillery # Artillery for performance
 
-      # Run basic security audit
-      - name: Security Audit (Base Check) # 4. Security Audit
-        run: npm audit --audit-level=high # Fail the build for High severity issues
-
-      # Execute tests
-      - name: Run Unit and Integration Tests # 5. Run Tests
+      - name: Run Unit Tests (Base Gate)
         run: npm test
+
+      - name: Run Basic Security Audit (npm audit)
+        run: npm audit --audit-level=high
+
+      # 2. DATA GATHERING FOR AI AGENTS
+      - name: Gather All Reports and Context
+        run: |
+          # Security Reports (Snyk, Semgrep)
+          snyk test --json > snyk_report.json
+          semgrep --config auto --json > semgrep_report.json
+          
+          # Performance Report (Simple Load Test using Artillery)
+          # Replace 'http://localhost:3000' with a test endpoint or temporary deployment URL
+          npx artillery quick --count 10 --num 5 --output performance_report.json 'http://localhost:3000/api/users'
+          
+          # Code Context (Git Diff)
+          git diff HEAD^ HEAD --no-color > code_changes.diff
+
+      # 3. EXECUTE AI AGENTS (The MCP Server Logic)
+      - name: AI Security Agent 🛡️
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
+        run: |
+          # Assuming llm-security-agent.ts is in the project root
+          ts-node llm-security-agent.ts > llm_security_report.json
+
+      - name: AI Performance Agent ⚡
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
+        run: |
+          # Assuming llm-performance-agent.ts is in the project root
+          ts-node llm-performance-agent.ts > llm_performance_report.json
+
+      - name: AI Code Quality Agent ✔️
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
+        run: |
+          # Assuming llm-quality-agent.ts is in the project root
+          ts-node llm-quality-agent.ts > llm_quality_report.json
+
+      # 4. ORCHESTRATION AND QUALITY GATE
+      - name: MCP Server Orchestration and Final Gate
+        run: |
+          # This script aggregates the three JSON reports and enforces the FAIL verdict.
+          ts-node mcp_orchestrator.ts
+          
+      # 5. POST FEEDBACK (Optional but highly recommended)
+      # - uses: actions/github-script@v6
+      #   with:
+      #     script: |
+      #       const fs = require('fs');
+      #       const report = JSON.parse(fs.readFileSync('mcp_final_report.json', 'utf8'));
+      #       # Use the GitHub API to post the report.summary as a comment on the PR.
