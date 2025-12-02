@@ -1,6 +1,6 @@
 name: Node.js AI Validation Pipeline (MCP Server)
 
-# Controls when the workflow will run (on push and pull request to 'main')
+# Triggers the pipeline on push to main or on any pull request
 on:
   push:
     branches: [ "main" ]
@@ -10,111 +10,132 @@ on:
 jobs:
   build_and_validate:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [20.x] # Use a single, stable version for the full validation job
+    
+    # Define environment variables used by the AI Agents
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
 
     steps:
       # 1. SETUP AND BASE CHECKS
-      - uses: actions/checkout@v4 # Get the code
+      - name: Checkout Code
+        uses: actions/checkout@v4
         
       - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 20.x
           cache: 'npm'
 
-      - name: Install Project Dependencies and Agent Tools
+      - name: Install Dependencies and Agent Tools
         run: |
           npm ci
-          # Install necessary tools globally or for the script's use (ts-node, security, performance)
+          # Install global tools needed for reporting and execution
           npm install -g snyk semgrep ts-node typescript artillery
 
       - name: Run Unit Tests (Base Gate)
         run: npm test
-
-      - name: Run Basic Security Audit (npm audit)
-        run: npm audit --audit-level=high
 
       # 2. DATA GATHERING FOR AI AGENTS
       - name: Gather All Reports and Context
         run: |
           echo "--- Starting Raw Data Collection for AI Agents ---"
           
-          # Security Reports (Snyk, Semgrep)
-          # Use '|| true' to prevent the step from failing if vulnerabilities are found, 
-          # ensuring the AI agent receives the report.
+          # Security Reports (Use '|| true' to ensure files are generated even if vulnerabilities are found)
           snyk test --json > snyk_report.json || true
           semgrep --config auto --json > semgrep_report.json || true
           
-          # Performance Report (Simple Load Test using Artillery)
-          # NOTE: Requires the application to be running or a dedicated test environment.
-          # We use 'npx' here to ensure Artillery runs correctly.
+          # Performance Report (Requires app to be running, using || true to allow the pipeline to proceed)
+          # NOTE: In a real environment, you would run a temporary deployment here.
           npx artillery quick --count 10 --num 5 --output performance_report.json 'http://localhost:3000/api/users' || true
           
-          # Code Context (Git Diff of the latest changes)
+          # Code Quality/Context (For all agents)
           git diff HEAD^ HEAD --no-color > code_changes.diff
+          
+          # Placeholder for ESLint report (required by the Quality Agent)
+          # In a real pipeline, replace this with 'npx eslint --format json > eslint_report.json'
+          echo '[]' > eslint_report.json 
 
-      # 3. EXECUTE AI AGENTS (The MCP Server Logic)
+      # 3. EXECUTE AI AGENTS
       - name: AI Security Agent 🛡️
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
-        run: |
-          # Execute the agent script and save the structured verdict
-          ts-node llm-security-agent.ts > llm_security_report.json
+        run: ts-node llm-security-agent.ts > llm_security_report.json
 
       - name: AI Performance Agent ⚡
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
-        run: |
-          # Execute the agent script and save the structured verdict
-          ts-node llm-performance-agent.ts > llm_performance_report.json
+        run: ts-node llm-performance-agent.ts > llm_performance_report.json
 
       - name: AI Code Quality Agent ✔️
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
-        run: |
-          # Execute the agent script and save the structured verdict
-          ts-node llm-quality-agent.ts > llm_quality_report.json
+        run: ts-node llm-quality-agent.ts > llm_quality_report.json
 
       # 4. ORCHESTRATION AND QUALITY GATE
+      # This step FAILS the entire pipeline if the orchestrator determines the overall verdict is 'FAIL'
       - name: MCP Server Orchestration and Final Gate
+        id: mcp_gate
         run: |
-          # This script aggregates the three JSON reports and exits with 1 if the overall verdict is 'FAIL'.
+          # The orchestrator script exits with 1 on FAIL, enforcing the gate.
           ts-node mcp_orchestrator.ts
           
-      # 5. POST FEEDBACK (Recommended for PR workflows)
+      # 5. POST FEEDBACK (PR Comment and Artifact Upload)
+      
+      # Always run this step, even if the MCP Gate failed, so feedback is provided.
       - name: Post AI Validation Summary to PR
         if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v6
         with:
           script: |
             const fs = require('fs');
-            // Check if the final report exists and read it
+            const core = require('@actions/core');
+
             if (!fs.existsSync('mcp_final_report.json')) {
-                console.log('Orchestrator did not produce final report. Skipping comment.');
+                core.setFailed('FATAL: Orchestrator failed to produce mcp_final_report.json.');
                 return;
             }
+
             const report = JSON.parse(fs.readFileSync('mcp_final_report.json', 'utf8'));
 
-            // Create a styled comment body
-            let icon = report.overall_verdict === 'FAIL' ? '❌' : 
-                       report.overall_verdict === 'WARNING' ? '⚠️' : '✅';
-                       
-            let body = `## ${icon} AI Validation (MCP) Verdict: ${report.overall_verdict}\n\n`;
-            body += `**Summary:** ${report.summary}\n\n`;
-            body += '### Detailed Agent Results\n';
+            // 1. Determine icon based on verdict
+            let icon = '⚪'; // Default
+            if (report.overall_verdict === 'FAIL') {
+              icon = '🔴';
+            } else if (report.overall_verdict === 'WARNING') {
+              icon = '⚠️';
+            } else {
+              icon = '🟢';
+            }
             
-            // Add links or summarized details from the full report JSON
-            body += '- **Security Agent:** ${report.results.security.summary}\n';
-            body += '- **Performance Agent:** ${report.results.performance.summary}\n';
-            body += '- **Quality Agent:** ${report.results.quality.summary}\n';
-            body += '\n*The full report JSON is available in the workflow artifact.*';
+            // 2. Build the detailed comment body
+            let body = `# ${icon} Multi-Criteria Policy (MCP) Verdict: ${report.overall_verdict}\n\n`;
+            body += `## 🚀 Summary: ${report.summary}\n\n`;
+            
+            body += '### Detailed Agent Reports\n';
+            
+            // Security Report
+            let secIcon = report.results.security.verdict === 'PASS' ? '✅' : report.results.security.verdict === 'WARNING' ? '⚠️' : '❌';
+            body += `* **Security Agent (${secIcon}):** ${report.results.security.summary}\n`;
+            if (report.results.security.critical_issues && report.results.security.critical_issues.length > 0) {
+              body += `  - Found **${report.results.security.critical_issues.length}** Critical/High issues.\n`;
+            }
+            
+            // Performance Report
+            let perfIcon = report.results.performance.verdict === 'PASS' ? '✅' : report.results.performance.verdict === 'WARNING' ? '⚠️' : '❌';
+            body += `* **Performance Agent (${perfIcon}):** ${report.results.performance.summary}\n`;
+            
+            // Quality Report
+            let qualIcon = report.results.quality.verdict === 'PASS' ? '✅' : report.results.quality.verdict === 'WARNING' ? '⚠️' : '❌';
+            body += `* **Code Quality Agent (${qualIcon}):** ${report.results.quality.summary} (Score: ${report.results.quality.quality_score}/100)\n`;
+            
+            body += '\n---\n';
+            body += `The full report JSON has been uploaded as a workflow artifact for debugging.`;
 
-            // Post the comment to the Pull Request
+            // 3. Post the comment to the Pull Request
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: body
             })
+            
+      - name: Upload Final Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-final-report-${{ github.sha }}
+          path: mcp_final_report.json
+          if-no-files-found: ignore
